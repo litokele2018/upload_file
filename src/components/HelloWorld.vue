@@ -1,14 +1,18 @@
 <template>
   <div>
     <input @change="handleFileChange" type="file" />
-    <el-button @click="handleUpload" type="primary">上传</el-button>
+    <el-button :disabled="upload" @click="handleUpload" type="primary">上传</el-button>
+    <el-button :disabled="pause" @click="handlePause" type="warning">暂停</el-button>
+    <el-button :disabled="con" @click="handleContinue" type="success">继续</el-button>
     <div>计算hash进度条</div>
     <el-progress :percentage="percentage"></el-progress>
     <el-alert :title="container.hash" type="success" v-if="container.hash.length > 0"></el-alert>
-    <div>chunks进度条</div>
-    <div :key="index" v-for="(item, index) in data">
-      <div>{{item.hash}}</div>
-      <el-progress :percentage="item.percentage"></el-progress>
+    <div v-if="container.hash.length > 0">
+      chunks进度条
+      <div :key="index" v-for="(item, index) in data">
+        <div>{{item.hash}}</div>
+        <el-progress :percentage="item.percentage"></el-progress>
+      </div>
     </div>
   </div>
 </template>
@@ -26,7 +30,13 @@ export default {
         hash: ''
       },
       data: [],
-      percentage: 0
+      // hash 计算的百分比
+      percentage: 0,
+      requestList: [],
+      upload: false,
+      pause: true,
+      con: true,
+      xhrs: []
     }
   },
   methods: {
@@ -36,7 +46,11 @@ export default {
       this.container.filename = file.name
       console.log(file)
     },
+    // 上传按钮
     async handleUpload() {
+      if (!this.container.file) return
+      this.upload = true
+      this.pause = false
       // 获得切片后的数组
       this.data = this.createFileChunk(this.container.file)
       // 计算hash
@@ -50,11 +64,36 @@ export default {
           percentage: 0
         }
       })
-      // 上传切片
       this.uploadChunks()
     },
+    // 暂停按钮
+    handlePause() {
+      if (!this.xhrs.length || !this.container.hash) return
+      this.pause = true
+      this.con = false
+      this.xhrs.forEach(item => {
+        item.abort()
+      })
+    },
+    // 继续
+    handleContinue() {
+      this.pause = false
+      this.con = true
+      this.uploadChunks()
+    },
+    // 上传切片
     async uploadChunks() {
-      const requestList = this.data
+      let verifyRes = await this.request({
+        url: 'http://localhost:3000/verify',
+        data: JSON.stringify({
+          filename: this.container.filename,
+          fileHash: this.container.hash
+        })
+      })
+      const uploadedList = JSON.parse(verifyRes.response)
+      console.log(uploadedList)
+      this.requestList = this.data
+        .filter(({ hash }) => !uploadedList.includes(hash))
         .map(({ chunk, hash, fileHash }, index) => {
           const formData = new FormData()
           formData.append('chunk', chunk)
@@ -69,24 +108,38 @@ export default {
           this.request({
             url: 'http://localhost:3000',
             data: formData,
-            onProgress: this.createProgressHandler(this.data[index])
+            onProgress: this.createProgressHandler(this.data[index]),
+            xhrs: this.xhrs
           })
         )
+      // console.log(this.xhrs) // xhr 数组
+      // console.log(this.requestList) // promise 数组
       // 上传切片
-      let response = await Promise.all(requestList)
+      let response = await Promise.all(this.requestList)
       console.log(response)
       // 发送请求合并切片
-      this.mergeChunks()
+      const res = await this.mergeChunks()
+      if (res.status !== 200) {
+        this.uploadChunks()
+      } else {
+        this.upload = false
+        this.con = true
+        this.pause = true
+        this.$message.success('上传成功')
+      }
     },
+    // 合并切片
     mergeChunks() {
-      this.request({
+      return this.request({
         url: 'http://localhost:3000/merge',
         data: JSON.stringify({
           filename: this.container.filename,
-          size: SIZE
+          size: SIZE,
+          fileHash: this.container.hash
         })
       })
     },
+    // 生成切片
     createFileChunk(file, size = SIZE) {
       let cur = 0
       let fileChunksList = []
@@ -101,6 +154,10 @@ export default {
     // 计算hash
     calculateHash(fileChunksList) {
       return new Promise(resolve => {
+        if (this.container.hash) {
+          resolve(this.container.hash)
+          return
+        }
         // 计算hash时， 采用web worker, ES6新出的
         const worker = new Worker('/hash.js')
         worker.postMessage({
@@ -108,7 +165,7 @@ export default {
         })
         worker.onmessage = e => {
           let { percentage, hash } = e.data
-          console.log(e.data)
+          // 修改hash计算的百分比
           this.percentage = Math.floor(percentage)
           if (hash) {
             this.container.hash = hash
@@ -121,11 +178,14 @@ export default {
       url,
       data,
       method = 'POST',
-      onProgress = e => console.log(e),
-      headers = {}
+      onProgress = e => e,
+      headers = {},
+      xhrs = []
     }) {
       return new Promise(resolve => {
         const xhr = new XMLHttpRequest()
+        // 放入xhr
+        xhrs.push(xhr)
         xhr.onprogress = onProgress
         xhr.open(method, url)
         Object.keys(headers).forEach(key => {
@@ -133,8 +193,9 @@ export default {
         })
         xhr.send(data)
         xhr.onload = e => {
-          const response = e.target.response
-          resolve(response)
+          let index = xhrs.indexOf(xhr)
+          xhrs.splice(index, 1)
+          resolve(e.target)
         }
       })
     },
